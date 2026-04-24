@@ -70,6 +70,32 @@ separate commit with its own tests.
 - If we end up needing numba or similar, we will justify it with a
   measurement.
 
+## Known framework issues
+
+Issues observed in `Backtest-Engine` from this repo. Do not fix them
+here — fix in `Backtest-Engine` with its own tests. This section
+documents active workarounds so future scripts know what to avoid.
+
+- **Engine `cash_rate` is applied per-asset and summed (bug).** In
+  `run_backtest`, the cash contribution is computed as
+  `(1 - |position|) * cash_rate` *per asset*, then the row-sum across
+  assets produces the portfolio return. For a multi-asset panel where
+  gross exposure is less than the number of assets, this overcounts
+  cash — e.g. a 2-asset panel with both positions at 0 earns
+  `2 * rf_daily` instead of `1 * rf_daily`. Any strategy whose per-day
+  `sum(|w_i|) < n_assets` is affected (which includes every partially
+  invested or flat-portion strategy).
+
+  *Current workaround (pairs scripts):* compound the DTB3 daily series
+  directly for the cash-only benchmark row instead of routing zero-
+  weights through `run_backtest`. The strategy and in-position
+  benchmarks (static-spread, long-y B&H) are left on the engine because
+  their gross exposure sums to the right figure for their own reporting
+  — but the Sharpe of the long-y B&H row is slightly overstated because
+  the engine applies cash to the zero-weight leg.
+
+  *Tracking:* to be fixed in `Backtest-Engine` in the next session.
+
 ## References
 
 - Gatev, Goetzmann, Rouwenhorst (2006), "Pairs Trading: Performance of
