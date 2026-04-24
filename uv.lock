@@ -1531,7 +1531,7 @@ wheels = [
 [[package]]
 name = "pairs-trading-research"
 version = "0.1.0"
-source = { virtual = "." }
+source = { editable = "." }
 dependencies = [
     { name = "backtest-engine" },
     { name = "scikit-learn" },
