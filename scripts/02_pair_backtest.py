@@ -12,6 +12,11 @@ For each pair we freeze an OLS hedge ratio on the SELECTION window
 VALIDATION window (2021-2022) only.  Fixed hedge ratio; Kalman is
 session 03.
 
+The OLS pipeline itself lives in :func:`pairs_trading.workflows.run_pair_backtest_ols`
+so session 03 can reuse it for its OLS comparison row.  This script
+composes the workflow with the per-pair benchmarks (static-spread
+hold, long-y B&H, cash-only) and the figure + CSV output.
+
 Anti-look-ahead audit
 ---------------------
 Pairs trading has several subtle paths for future information to leak
@@ -77,7 +82,6 @@ import pandas as pd
 from backtester.backtest.engine import run_backtest
 from backtester.costs.linear import LinearCost
 from backtester.data.loader import load_prices, to_returns
-from backtester.data.rates import load_risk_free_rate, to_daily_rate
 from backtester.metrics.performance import (
     annualized_return,
     annualized_volatility,
@@ -90,20 +94,14 @@ from backtester.metrics.performance import (
     sortino_ratio,
     turnover,
 )
-from pairs_trading.hedge_ratio import ols_hedge_ratio
 from pairs_trading.selection import (
     SELECTION_END,
     SELECTION_START,
     VALIDATION_END,
     VALIDATION_START,
-    compute_half_life,
 )
-from pairs_trading.signals import (
-    compute_live_spread,
-    spread_position_to_asset_weights,
-    zscore,
-    zscore_signal,
-)
+from pairs_trading.signals import spread_position_to_asset_weights
+from pairs_trading.workflows import build_cash_rate, run_pair_backtest_ols
 
 logger = logging.getLogger(__name__)
 
@@ -117,7 +115,6 @@ ENTRY_Z = 2.0
 EXIT_Z = 0.5
 STOP_Z = 4.0
 COST_BPS = 5.0  # LinearCost(5.0) == 5 bps per unit of |Δposition|.
-MIN_Z_WINDOW = 20
 
 PAIRS: list[tuple[str, str]] = [
     ("GOOG", "GOOGL"),
@@ -128,22 +125,6 @@ PAIRS: list[tuple[str, str]] = [
 # ---------------------------------------------------------------------------
 # Per-pair pipeline
 # ---------------------------------------------------------------------------
-
-
-def _build_cash_rate(index: pd.DatetimeIndex) -> pd.Series:
-    """Daily DTB3 rate aligned to *index*, ffilled over weekends/holidays."""
-    rf_annual = load_risk_free_rate(
-        VALIDATION_START, VALIDATION_END, series="DTB3"
-    )
-    rf_daily = to_daily_rate(rf_annual, periods_per_year=252, method="simple")
-    # Reindex to the returns calendar, forward-fill (FRED publishes only on
-    # business days; the rate in effect on an equity holiday is the prior
-    # publication).  Back-fill the leading edge if FRED's first point is
-    # after the first trading day (rare; happens around year boundaries).
-    rf_daily = rf_daily.reindex(rf_daily.index.union(index)).ffill()
-    rf_daily = rf_daily.reindex(index).bfill()
-    rf_daily.name = "DTB3_daily"
-    return rf_daily
 
 
 def _metrics_row(
@@ -186,86 +167,49 @@ def run_pair(
     rows: list[dict[str, float | str]],
     axes_row: dict[str, plt.Axes],
 ) -> dict[str, object]:
-    """Run the full pipeline for one pair and append rows + draw plots."""
+    """Compose the OLS workflow with per-pair benchmarks + plotting."""
     y_ticker, x_ticker = pair
-    print(f"\n=== {y_ticker} / {x_ticker} ===")
+    pair_label = f"{y_ticker}/{x_ticker}"
+    print(f"\n=== {pair_label} ===")
 
-    # 1. Load prices over the full span the pair needs (selection + validation).
-    prices = load_prices(
-        [y_ticker, x_ticker],
-        SELECTION_START,
-        VALIDATION_END,
-        alignment="inner",
+    # 1. The OLS workflow runs steps 1–10 of the original script.
+    out = run_pair_backtest_ols(
+        pair=pair,
+        selection_window=(SELECTION_START, SELECTION_END),
+        validation_window=(VALIDATION_START, VALIDATION_END),
+        cost_bps=COST_BPS,
+        z_entry=ENTRY_Z,
+        z_exit=EXIT_Z,
+        z_stop=STOP_Z,
     )
-    y_full = prices[y_ticker]
-    x_full = prices[x_ticker]
-
-    # 2. Selection slice for the OLS fit.
-    sel_mask = (prices.index >= SELECTION_START) & (prices.index <= SELECTION_END)
-    y_sel = y_full.loc[sel_mask]
-    x_sel = x_full.loc[sel_mask]
-
-    # 3. Freeze OLS hedge ratio on selection data only.
-    hedge = ols_hedge_ratio(y_sel, x_sel, log_prices=True)
-    print(f"  OLS fit (selection, log-prices): alpha={hedge.alpha:.4f}  "
-          f"beta={hedge.beta:.4f}")
-
-    # 4. Half-life on the selection spread → rolling window.
-    half_life = compute_half_life(hedge.spread)
-    window = max(int(round(2 * half_life)), MIN_Z_WINDOW)
-    window_floored = window == MIN_Z_WINDOW
-    print(f"  Selection-window half-life: {half_life:.2f} days → "
-          f"z-score window = {window} days"
-          f"{' (floor binding)' if window_floored else ''}")
-
-    # 5. Live spread over the full concat, with no intercept (Q2 convention).
-    live_spread_full = compute_live_spread(
-        y_full, x_full,
-        beta=hedge.beta,
-        alpha=hedge.alpha,
-        log_prices=True,
-        use_intercept_in_spread=False,
-    )
-
-    # 6. Causal rolling z-score over the full concat, then slice to validation.
-    z_full = zscore(live_spread_full, window=window)
-    val_mask = (prices.index >= VALIDATION_START) & (prices.index <= VALIDATION_END)
-    z_val = z_full.loc[val_mask]
-
-    # 7. State-machine signal on validation z only.
-    spread_pos = zscore_signal(z_val, entry_z=ENTRY_Z, exit_z=EXIT_Z, stop_z=STOP_Z)
-    weights = spread_position_to_asset_weights(
-        spread_pos, hedge_ratio=hedge.beta, pair=pair
-    )
-
-    # 8. Validation simple returns (engine requires simple, not log).
-    prices_val = prices.loc[val_mask, [y_ticker, x_ticker]]
-    returns_val = to_returns(prices_val, method="simple").iloc[1:]
-    # Align weights and returns on the same index (returns drops row 0).
-    weights = weights.reindex(returns_val.index)
-    weights = weights[[y_ticker, x_ticker]]  # column order matches returns.
-
-    # 9. Cash rate on the returns calendar.
-    rf_daily = _build_cash_rate(returns_val.index)
-
-    # 10. Run backtest (signal_lag=1 is non-negotiable).
-    result = run_backtest(
-        signal=weights,
-        returns=returns_val,
-        cost_model=LinearCost(COST_BPS),
-        signal_lag=1,
-        cash_rate=rf_daily,
+    result = out["result"]
+    beta = out["beta"]
+    half_life = out["half_life"]
+    z_val = out["zscore"]
+    window = max(int(round(2 * half_life)), 20)
+    print(
+        f"  OLS fit (selection, log-prices): beta={beta:.4f}  "
+        f"half-life={half_life:.2f}d  z-window={window}d"
     )
 
     strat_net = result.portfolio_net_returns
     strat_gross = result.portfolio_gross_returns
     positions = result.positions
 
-    # 11. Benchmark: static spread (always +1 spread position).
-    static_pos = pd.Series(1, index=spread_pos.index)
+    # 2. Reload returns for the benchmark backtests.  load_prices is cached.
+    prices = load_prices(
+        [y_ticker, x_ticker], SELECTION_START, VALIDATION_END, alignment="inner"
+    )
+    val_mask = (prices.index >= VALIDATION_START) & (prices.index <= VALIDATION_END)
+    prices_val = prices.loc[val_mask, [y_ticker, x_ticker]]
+    returns_val = to_returns(prices_val, method="simple").iloc[1:]
+    rf_daily = build_cash_rate(returns_val.index, VALIDATION_START, VALIDATION_END)
+
+    # 3. Benchmark: static spread (always +1 spread position).
+    static_pos = pd.Series(1, index=z_val.index)
     static_weights = spread_position_to_asset_weights(
-        static_pos, hedge_ratio=hedge.beta, pair=pair
-    ).reindex(returns_val.index)
+        static_pos, hedge_ratio=beta, pair=pair
+    ).reindex(returns_val.index)[[y_ticker, x_ticker]]
     static_result = run_backtest(
         signal=static_weights,
         returns=returns_val,
@@ -274,7 +218,7 @@ def run_pair(
         cash_rate=rf_daily,
     )
 
-    # 12. Benchmark: long-y buy-and-hold.
+    # 4. Benchmark: long-y buy-and-hold.
     bh_weights = pd.DataFrame(
         {y_ticker: 1.0, x_ticker: 0.0}, index=returns_val.index
     )[[y_ticker, x_ticker]]
@@ -286,17 +230,15 @@ def run_pair(
         cash_rate=rf_daily,
     )
 
-    # 13. Benchmark: cash-only.  We compound the daily DTB3 directly rather
-    # than routing zero-weights through the engine — the engine adds the
-    # cash term per asset, which would double-count for a 2-asset panel
-    # with both positions at 0.  This produces the true cash equity curve.
+    # 5. Benchmark: cash-only.  Post-engine-fix this could route zero-
+    # weights through run_backtest, but compounding the daily DTB3
+    # directly is exactly equivalent and one fewer moving part.
     cash_only_returns = rf_daily.copy()
     cash_only_returns.name = "cash_only"
 
-    # 14. Metric rows.
-    pair_label = f"{y_ticker}/{x_ticker}"
+    # 6. Metric rows.
     rows.append({
-        "pair": pair_label, "beta": hedge.beta, "half_life": half_life,
+        "pair": pair_label, "beta": beta, "half_life": half_life,
         "z_window": window,
         **_metrics_row(
             f"{pair_label} strategy (net)",
@@ -304,7 +246,7 @@ def run_pair(
         ),
     })
     rows.append({
-        "pair": pair_label, "beta": hedge.beta, "half_life": half_life,
+        "pair": pair_label, "beta": beta, "half_life": half_life,
         "z_window": window,
         **_metrics_row(
             f"{pair_label} long-{y_ticker} B&H",
@@ -315,7 +257,7 @@ def run_pair(
         ),
     })
     rows.append({
-        "pair": pair_label, "beta": hedge.beta, "half_life": half_life,
+        "pair": pair_label, "beta": beta, "half_life": half_life,
         "z_window": window,
         **_metrics_row(
             f"{pair_label} static-spread",
@@ -326,7 +268,7 @@ def run_pair(
         ),
     })
     rows.append({
-        "pair": pair_label, "beta": hedge.beta, "half_life": half_life,
+        "pair": pair_label, "beta": beta, "half_life": half_life,
         "z_window": window,
         **_metrics_row(
             f"{pair_label} cash-only",
@@ -337,8 +279,6 @@ def run_pair(
         ),
     })
 
-    # 15. Plots.  z_val has one more row than positions (returns drops row 0);
-    # align to the backtest calendar for the visual.
     _plot_pair(
         axes_row,
         pair_label=pair_label,
@@ -349,7 +289,7 @@ def run_pair(
         cash_net=cash_only_returns,
     )
 
-    # 16. Red-flag diagnostic: Sharpe > 1.5 should be scrutinized.
+    # 7. Red-flag diagnostic: Sharpe > 1.5 should be scrutinized.
     strat_sharpe = sharpe_ratio(strat_net, rf=rf_daily)
     if strat_sharpe > 1.5:
         abs_exp = positions.abs().sum(axis=1)
@@ -363,7 +303,6 @@ def run_pair(
 
     return {
         "pair": pair_label,
-        "spread_pos": spread_pos,
         "z_val": z_val,
         "positions": positions,
         "strat_net": strat_net,
@@ -397,8 +336,7 @@ def _plot_pair(
     ]:
         ls, color = style
         ax_z.axhline(level, linestyle=ls, color=color, linewidth=0.8, alpha=0.7)
-    # Shade in-position windows: green for long-spread, red for short.
-    pos_sign = np.sign(positions.iloc[:, 0].to_numpy())  # sign of y-weight
+    pos_sign = np.sign(positions.iloc[:, 0].to_numpy())
     _shade_positions(ax_z, z.index.to_numpy(), pos_sign)
     ax_z.set_title(f"{pair_label} — validation-window z-score")
     ax_z.set_ylabel("z")
@@ -478,9 +416,7 @@ def main() -> None:
     fig.savefig(FIGURE_PATH, dpi=150, bbox_inches="tight")
     plt.close(fig)
 
-    # Persist metrics.
     df = pd.DataFrame(rows)
-    # Column order for readability.
     col_order = [
         "pair", "label", "beta", "half_life", "z_window",
         "ann_return", "ann_vol", "sharpe", "sharpe_gross", "sortino",
@@ -490,7 +426,6 @@ def main() -> None:
     df = df[col_order]
     df.to_csv(METRICS_CSV, index=False, float_format="%.6f")
 
-    # Stdout summary.
     print("\nMetrics summary")
     print("---------------")
     summary_cols = [
